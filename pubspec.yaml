@@ -1,12 +1,3 @@
-name: leeshare
-description: A Flutter-based file-sharing app for Windows that uses WiFi as a medium. Allows devices on the same network to share files with custom names.
-publish_to: 'none'
-version: 0.1.0+1
-
-environment:
-  sdk: '>=3.5.0 <4.0.0'
-  flutter: '>=3.22.0'
-
 dependencies:
   flutter:
     sdk: flutter
@@ -14,18 +5,7 @@ dependencies:
   file_picker: ^6.1.1
   permission_handler: ^11.2.0
   provider: ^6.1.2
+  shared_preferences: ^2.2.2
   flutter_localizations:
     sdk: flutter
   intl: ^0.19.0
-
-dev_dependencies:
-  flutter_test:
-    sdk: flutter
-  flutter_lints: ^4.0.0
-
-flutter:
-  uses-material-design: true
-  generate: true
-
-  assets:
-    - assets/
