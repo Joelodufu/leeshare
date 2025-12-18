@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:lan_sharing/lan_sharing.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -9,8 +10,8 @@ import 'package:path_provider/path_provider.dart';
 import 'package:wifi_info_flutter/wifi_info_flutter.dart';
 import 'package:network_info_plus/network_info_plus.dart';
 import 'package:flutter_lan_scan/flutter_lan_scan.dart';
+import 'package:logger/logger.dart';
 import 'package:dio/dio.dart';
-import 'package:file_saver/file_saver.dart';
 
 void main() {
   runApp(const MyApp());
@@ -54,15 +55,17 @@ class _MyHomePageState extends State<MyHomePage> {
   String _localIp = 'Unknown';
   String _wifiSsid = 'Unknown';
   bool _isScanning = false;
+  final Logger _logger = Logger();
   final NetworkInfo _networkInfo = NetworkInfo();
   final FlutterLanScan _lanScanner = FlutterLanScan();
+  final Dio _dio = Dio();
 
   @override
   void initState() {
     super.initState();
     _requestPermissions();
     _loadDeviceName();
-    _fetchNetworkInfo();
+    _getNetworkInfo();
   }
 
   Future<void> _loadDeviceName() async {
@@ -87,16 +90,17 @@ class _MyHomePageState extends State<MyHomePage> {
     await Permission.nearbyWifiDevices.request();
   }
 
-  Future<void> _fetchNetworkInfo() async {
+  Future<void> _getNetworkInfo() async {
     try {
-      final wifiName = await WifiInfo().getWifiName();
       final ip = await _networkInfo.getWifiIP();
+      final ssid = await WiFiInfo().getWifiName();
       setState(() {
-        _wifiSsid = wifiName ?? 'Not connected';
         _localIp = ip ?? 'Unknown';
+        _wifiSsid = ssid ?? 'Unknown';
       });
+      _logger.i('Local IP: $ip, WiFi SSID: $ssid');
     } catch (e) {
-      print('Failed to fetch network info: $e');
+      _logger.e('Failed to get network info: $e');
     }
   }
 
@@ -113,7 +117,7 @@ class _MyHomePageState extends State<MyHomePage> {
         try {
           final fileData = data as Map<String, dynamic>;
           final fileName = fileData['fileName'] as String;
-          final fileBytes = base64.decode(fileData['content'] as String);
+          final fileBytes = base64Decode(fileData['content'] as String);
           
           final directory = await getApplicationDocumentsDirectory();
           final file = File('${directory.path}/received_$fileName');
@@ -141,6 +145,7 @@ class _MyHomePageState extends State<MyHomePage> {
       setState(() {
         _status = 'Failed to start server: $e';
       });
+      _logger.e('Server start error: $e');
     }
   }
 
@@ -148,21 +153,16 @@ class _MyHomePageState extends State<MyHomePage> {
     try {
       setState(() {
         _isScanning = true;
-        _status = 'Scanning network...';
+        _status = 'Discovering devices on WiFi...';
         _discoveredServers.clear();
         _devices.clear();
       });
 
       // Use LAN scanner to find devices on local network
       final devices = await _lanScanner.scan();
-      final discovered = <String>[];
-      for (final device in devices) {
-        if (device.ip != null) {
-          discovered.add('${device.ip} (${device.hostname ?? 'Unknown'})');
-        }
-      }
-
-      // Also use existing LanClient for discovery
+      final discovered = devices.map((device) => device.ip).where((ip) => ip != null).cast<String>().toList();
+      
+      // Also try traditional LanClient discovery
       if (_client == null) {
         _client = LanClient(
           onData: (data) {
@@ -178,7 +178,7 @@ class _MyHomePageState extends State<MyHomePage> {
                 }
               }
             } catch (e) {
-              print('Failed to decode discovery response: $e');
+              _logger.w('Failed to decode discovery response: $e');
             }
           },
         );
@@ -199,18 +199,27 @@ class _MyHomePageState extends State<MyHomePage> {
           if (decoded is Map && decoded.containsKey('deviceName')) {
             final deviceName = decoded['deviceName'] as String;
             if (!_discoveredServers.contains(deviceName)) {
-              _discoveredServers.add(deviceName);
+              setState(() {
+                _discoveredServers.add(deviceName);
+                _devices = List.from(_discoveredServers);
+              });
             }
           }
         } catch (e) {
-          print('Failed to discover server $server: $e');
+          _logger.w('Failed to discover server $server: $e');
         }
       }
 
-      // Combine LAN scan results with discovered servers
-      final allDevices = [...discovered, ..._discoveredServers];
+      // Add IPs from LAN scan
+      for (final ip in discovered) {
+        if (!_devices.contains(ip)) {
+          setState(() {
+            _devices.add('Device at $ip');
+          });
+        }
+      }
+
       setState(() {
-        _devices = allDevices.toSet().toList();
         _isScanning = false;
         _status = _devices.isEmpty 
             ? 'No devices found on the network'
@@ -221,6 +230,7 @@ class _MyHomePageState extends State<MyHomePage> {
         _isScanning = false;
         _status = 'Discovery failed: $e';
       });
+      _logger.e('Discovery error: $e');
     }
   }
 
@@ -247,32 +257,39 @@ class _MyHomePageState extends State<MyHomePage> {
       try {
         final fileBytes = await File(filePath).readAsBytes();
         final fileName = file.name;
-        final base64Content = base64.encode(fileBytes);
+        final base64Content = base64Encode(fileBytes);
         
         setState(() {
           _status = 'Sending $fileName to $_selectedDevice...';
         });
 
-        // Find the server address for the selected device
-        final serverAddress = _client!.servers.firstWhere(
-          (server) => server.contains(_selectedDevice),
-          orElse: () => '',
-        );
+        // Determine if selected device is an IP or a device name
+        String? targetIp;
+        if (_selectedDevice.startsWith('Device at ')) {
+          targetIp = _selectedDevice.substring('Device at '.length);
+        } else {
+          // Look up IP from discovered servers (simplistic)
+          targetIp = _client?.servers.firstWhere(
+            (server) => server.contains(_selectedDevice),
+            orElse: () => '',
+          );
+        }
 
-        if (serverAddress.isEmpty) {
+        if (targetIp == null || targetIp.isEmpty) {
           setState(() {
             _status = 'Selected device not found';
           });
           return;
         }
 
+        // Use LanClient to send file
         final response = await _client!.sendMessage(
           endpoint: '/receiveFile',
           data: {
             'fileName': fileName,
             'content': base64Content,
           },
-          server: serverAddress,
+          server: targetIp,
         );
 
         final decoded = jsonDecode(response);
@@ -289,6 +306,7 @@ class _MyHomePageState extends State<MyHomePage> {
         setState(() {
           _status = 'Failed to send file: $e';
         });
+        _logger.e('File send error: $e');
       }
     }
   }
@@ -349,6 +367,24 @@ class _MyHomePageState extends State<MyHomePage> {
                         },
                         child: const Text('Change Device Name'),
                       ),
+                    const SizedBox(height: 12),
+                    Row(
+                      children: [
+                        const Icon(Icons.wifi, size: 18, color: Colors.grey),
+                        const SizedBox(width: 8),
+                        Text(
+                          'WiFi: $_wifiSsid',
+                          style: const TextStyle(color: Colors.grey),
+                        ),
+                        const Spacer(),
+                        const Icon(Icons.settings_ethernet, size: 18, color: Colors.grey),
+                        const SizedBox(width: 8),
+                        Text(
+                          'IP: $_localIp',
+                          style: const TextStyle(color: Colors.grey),
+                        ),
+                      ],
+                    ),
                   ],
                 ),
               ),
@@ -361,18 +397,10 @@ class _MyHomePageState extends State<MyHomePage> {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(
-                      'Network Info',
+                      'Network Status',
                       style: Theme.of(context).textTheme.titleMedium,
                     ),
                     const SizedBox(height: 12),
-                    Text('WiFi: $_wifiSsid'),
-                    Text('Local IP: $_localIp'),
-                    const SizedBox(height: 16),
-                    Text(
-                      'Status',
-                      style: Theme.of(context).textTheme.titleMedium,
-                    ),
-                    const SizedBox(height: 8),
                     Text(_status),
                     const SizedBox(height: 16),
                     Wrap(
@@ -387,7 +415,7 @@ class _MyHomePageState extends State<MyHomePage> {
                         ElevatedButton.icon(
                           onPressed: _isScanning ? null : _discoverDevices,
                           icon: _isScanning 
-                              ? const CircularProgressIndicator.adaptive()
+                              ? const CircularProgressIndicator()
                               : const Icon(Icons.search),
                           label: Text(_isScanning ? 'Scanning...' : 'Discover Devices'),
                         ),
